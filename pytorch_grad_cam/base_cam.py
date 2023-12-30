@@ -1,7 +1,8 @@
 import numpy as np
 import torch
+import pdb
 import ttach as tta
-from typing import Callable, List, Tuple, Optional
+from typing import Callable, List, Tuple
 from pytorch_grad_cam.activations_and_gradients import ActivationsAndGradients
 from pytorch_grad_cam.utils.svd_on_activations import get_2d_projection
 from pytorch_grad_cam.utils.image import scale_cam_image
@@ -12,28 +13,18 @@ class BaseCAM:
     def __init__(self,
                  model: torch.nn.Module,
                  target_layers: List[torch.nn.Module],
+                 use_cuda: bool = False,
                  reshape_transform: Callable = None,
                  compute_input_gradient: bool = False,
-                 uses_gradients: bool = True,
-                 tta_transforms: Optional[tta.Compose] = None) -> None:
+                 uses_gradients: bool = True) -> None:
         self.model = model.eval()
         self.target_layers = target_layers
-
-        # Use the same device as the model.
-        self.device = next(self.model.parameters()).device
+        self.cuda = use_cuda
+        if self.cuda:
+            self.model = model.cuda()
         self.reshape_transform = reshape_transform
         self.compute_input_gradient = compute_input_gradient
         self.uses_gradients = uses_gradients
-        if tta_transforms is None:
-            self.tta_transforms = tta.Compose(
-                [
-                    tta.HorizontalFlip(),
-                    tta.Multiply(factors=[0.9, 1, 1.1]),
-                ]
-            )
-        else:
-            self.tta_transforms = tta_transforms
-
         self.activations_and_grads = ActivationsAndGradients(
             self.model, target_layers, reshape_transform)
 
@@ -74,14 +65,16 @@ class BaseCAM:
                 targets: List[torch.nn.Module],
                 eigen_smooth: bool = False) -> np.ndarray:
 
-        input_tensor = input_tensor.to(self.device)
+        if self.cuda:
+            input_tensor = input_tensor.cuda()
 
         if self.compute_input_gradient:
             input_tensor = torch.autograd.Variable(input_tensor,
                                                    requires_grad=True)
-
-        self.outputs = outputs = self.activations_and_grads(input_tensor)
-
+        if isinstance(input_tensor, dict):
+            outputs = self.activations_and_grads.dict_call(**input_tensor)
+        else:
+            outputs = self.activations_and_grads(input_tensor)
         if targets is None:
             target_categories = np.argmax(outputs.cpu().data.numpy(), axis=-1)
             targets = [ClassifierOutputTarget(
@@ -109,6 +102,8 @@ class BaseCAM:
 
     def get_target_width_height(self,
                                 input_tensor: torch.Tensor) -> Tuple[int, int]:
+        if isinstance(input_tensor, dict):
+            input_tensor = input_tensor['pixel_values']
         width, height = input_tensor.size(-1), input_tensor.size(-2)
         return width, height
 
@@ -158,8 +153,14 @@ class BaseCAM:
                                        input_tensor: torch.Tensor,
                                        targets: List[torch.nn.Module],
                                        eigen_smooth: bool = False) -> np.ndarray:
+        transforms = tta.Compose(
+            [
+                tta.HorizontalFlip(),
+                tta.Multiply(factors=[0.9, 1, 1.1]),
+            ]
+        )
         cams = []
-        for transform in self.tta_transforms:
+        for transform in transforms:
             augmented_tensor = transform.augment_image(input_tensor)
             cam = self.forward(augmented_tensor,
                                targets,
